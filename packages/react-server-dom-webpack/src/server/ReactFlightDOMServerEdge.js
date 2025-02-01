@@ -12,8 +12,11 @@ import type {Thenable} from 'shared/ReactTypes';
 import type {ClientManifest} from './ReactFlightServerConfigWebpackBundler';
 import type {ServerManifest} from 'react-client/src/ReactFlightClientConfig';
 
+import {ASYNC_ITERATOR} from 'shared/ReactSymbols';
+
 import {
   createRequest,
+  createPrerenderRequest,
   startWork,
   startFlowing,
   stopFlowing,
@@ -24,6 +27,9 @@ import {
   createResponse,
   close,
   getRoot,
+  reportGlobalError,
+  resolveField,
+  resolveFile,
 } from 'react-server/src/ReactFlightReplyServer';
 
 import {
@@ -131,25 +137,27 @@ function prerender(
       );
       resolve({prelude: stream});
     }
-    const request = createRequest(
+    const request = createPrerenderRequest(
       model,
       webpackMap,
+      onAllReady,
+      onFatalError,
       options ? options.onError : undefined,
       options ? options.identifierPrefix : undefined,
       options ? options.onPostpone : undefined,
       options ? options.temporaryReferences : undefined,
       __DEV__ && options ? options.environmentName : undefined,
       __DEV__ && options ? options.filterStackFrame : undefined,
-      onAllReady,
-      onFatalError,
     );
     if (options && options.signal) {
       const signal = options.signal;
       if (signal.aborted) {
-        abort(request, (signal: any).reason);
+        const reason = (signal: any).reason;
+        abort(request, reason);
       } else {
         const listener = () => {
-          abort(request, (signal: any).reason);
+          const reason = (signal: any).reason;
+          abort(request, reason);
           signal.removeEventListener('abort', listener);
         };
         signal.addEventListener('abort', listener);
@@ -180,10 +188,56 @@ function decodeReply<T>(
   return root;
 }
 
+function decodeReplyFromAsyncIterable<T>(
+  iterable: AsyncIterable<[string, string | File]>,
+  webpackMap: ServerManifest,
+  options?: {temporaryReferences?: TemporaryReferenceSet},
+): Thenable<T> {
+  const iterator: AsyncIterator<[string, string | File]> =
+    iterable[ASYNC_ITERATOR]();
+
+  const response = createResponse(
+    webpackMap,
+    '',
+    options ? options.temporaryReferences : undefined,
+  );
+
+  function progress(
+    entry:
+      | {done: false, +value: [string, string | File], ...}
+      | {done: true, +value: void, ...},
+  ) {
+    if (entry.done) {
+      close(response);
+    } else {
+      const [name, value] = entry.value;
+      if (typeof value === 'string') {
+        resolveField(response, name, value);
+      } else {
+        resolveFile(response, name, value);
+      }
+      iterator.next().then(progress, error);
+    }
+  }
+  function error(reason: Error) {
+    reportGlobalError(response, reason);
+    if (typeof (iterator: any).throw === 'function') {
+      // The iterator protocol doesn't necessarily include this but a generator do.
+      // $FlowFixMe should be able to pass mixed
+      iterator.throw(reason).then(error, error);
+    }
+  }
+
+  iterator.next().then(progress, error);
+
+  return getRoot(response);
+}
+
 export {
   renderToReadableStream,
   prerender,
   decodeReply,
+  decodeReplyFromAsyncIterable,
   decodeAction,
   decodeFormState,
 };

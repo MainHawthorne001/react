@@ -1,7 +1,7 @@
 {
   "name": "react-server-dom-esm",
   "description": "React Server Components bindings for DOM using ESM. This is intended to be integrated into meta-frameworks. It is not intended to be imported directly.",
-  "version": "19.0.0",
+  "version": "19.1.0",
   "keywords": [
     "react"
   ],
@@ -58,6 +58,7 @@
     "react-dom": "^19.0.0"
   },
   "dependencies": {
-    "acorn-loose": "^8.3.0"
+    "acorn-loose": "^8.3.0",
+    "webpack-sources": "^3.2.0"
   }
 }

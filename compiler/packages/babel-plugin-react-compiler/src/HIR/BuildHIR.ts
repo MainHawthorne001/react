@@ -215,7 +215,8 @@ export function lower(
     id,
     params,
     fnType: parent == null ? env.fnType : 'Other',
-    returnType: null, // TODO: extract the actual return type node if present
+    returnTypeAnnotation: null, // TODO: extract the actual return type node if present
+    returnType: makeType(),
     body: builder.build(),
     context,
     generator: func.node.generator === true,
@@ -419,7 +420,19 @@ function lowerStatement(
             // Already hoisted
             continue;
           }
-          if (!binding.path.isVariableDeclarator()) {
+
+          let kind:
+            | InstructionKind.Let
+            | InstructionKind.HoistedConst
+            | InstructionKind.HoistedLet
+            | InstructionKind.HoistedFunction;
+          if (binding.kind === 'const' || binding.kind === 'var') {
+            kind = InstructionKind.HoistedConst;
+          } else if (binding.kind === 'let') {
+            kind = InstructionKind.HoistedLet;
+          } else if (binding.path.isFunctionDeclaration()) {
+            kind = InstructionKind.HoistedFunction;
+          } else if (!binding.path.isVariableDeclarator()) {
             builder.errors.push({
               severity: ErrorSeverity.Todo,
               reason: 'Unsupported declaration type for hoisting',
@@ -428,11 +441,7 @@ function lowerStatement(
               loc: id.parentPath.node.loc ?? GeneratedSource,
             });
             continue;
-          } else if (
-            binding.kind !== 'const' &&
-            binding.kind !== 'var' &&
-            binding.kind !== 'let'
-          ) {
+          } else {
             builder.errors.push({
               severity: ErrorSeverity.Todo,
               reason: 'Handle non-const declarations for hoisting',
@@ -442,6 +451,7 @@ function lowerStatement(
             });
             continue;
           }
+
           const identifier = builder.resolveIdentifier(id);
           CompilerError.invariant(identifier.kind === 'Identifier', {
             reason:
@@ -455,13 +465,6 @@ function lowerStatement(
             reactive: false,
             loc: id.node.loc ?? GeneratedSource,
           };
-          const kind =
-            // Avoid double errors on var declarations, which we do not plan to support anyways
-            binding.kind === 'const' || binding.kind === 'var'
-              ? InstructionKind.HoistedConst
-              : binding.kind === 'let'
-                ? InstructionKind.HoistedLet
-                : assertExhaustive(binding.kind, 'Unexpected binding kind');
           lowerValueToTemporary(builder, {
             kind: 'DeclareContext',
             lvalue: {
@@ -606,6 +609,7 @@ function lowerStatement(
             ),
             consequent: bodyBlock,
             alternate: continuationBlock.id,
+            fallthrough: continuationBlock.id,
             id: makeInstructionId(0),
             loc: stmt.node.loc ?? GeneratedSource,
           },
@@ -655,16 +659,13 @@ function lowerStatement(
         },
         conditionalBlock,
       );
-      /*
-       * The conditional block is empty and exists solely as conditional for
-       * (re)entering or exiting the loop
-       */
       const test = lowerExpressionToTemporary(builder, stmt.get('test'));
       const terminal: BranchTerminal = {
         kind: 'branch',
         test,
         consequent: loopBlock,
         alternate: continuationBlock.id,
+        fallthrough: conditionalBlock.id,
         id: makeInstructionId(0),
         loc: stmt.node.loc ?? GeneratedSource,
       };
@@ -974,6 +975,7 @@ function lowerStatement(
         test,
         consequent: loopBlock,
         alternate: continuationBlock.id,
+        fallthrough: conditionalBlock.id,
         id: makeInstructionId(0),
         loc,
       };
@@ -999,7 +1001,7 @@ function lowerStatement(
       lowerAssignment(
         builder,
         stmt.node.loc ?? GeneratedSource,
-        InstructionKind.Let,
+        InstructionKind.Function,
         id,
         fn,
         'Assignment',
@@ -1076,6 +1078,12 @@ function lowerStatement(
       const left = stmt.get('left');
       const leftLoc = left.node.loc ?? GeneratedSource;
       let test: Place;
+      const advanceIterator = lowerValueToTemporary(builder, {
+        kind: 'IteratorNext',
+        loc: leftLoc,
+        iterator: {...iterator},
+        collection: {...value},
+      });
       if (left.isVariableDeclaration()) {
         const declarations = left.get('declarations');
         CompilerError.invariant(declarations.length === 1, {
@@ -1085,12 +1093,6 @@ function lowerStatement(
           suggestions: null,
         });
         const id = declarations[0].get('id');
-        const advanceIterator = lowerValueToTemporary(builder, {
-          kind: 'IteratorNext',
-          loc: leftLoc,
-          iterator: {...iterator},
-          collection: {...value},
-        });
         const assign = lowerAssignment(
           builder,
           leftLoc,
@@ -1101,13 +1103,19 @@ function lowerStatement(
         );
         test = lowerValueToTemporary(builder, assign);
       } else {
-        builder.errors.push({
-          reason: `(BuildHIR::lowerStatement) Handle ${left.type} inits in ForOfStatement`,
-          severity: ErrorSeverity.Todo,
-          loc: left.node.loc ?? null,
-          suggestions: null,
+        CompilerError.invariant(left.isLVal(), {
+          loc: leftLoc,
+          reason: 'Expected ForOf init to be a variable declaration or lval',
         });
-        return;
+        const assign = lowerAssignment(
+          builder,
+          leftLoc,
+          InstructionKind.Reassign,
+          left,
+          advanceIterator,
+          'Assignment',
+        );
+        test = lowerValueToTemporary(builder, assign);
       }
       builder.terminateWithContinuation(
         {
@@ -1117,6 +1125,7 @@ function lowerStatement(
           consequent: loopBlock,
           alternate: continuationBlock.id,
           loc: stmt.node.loc ?? GeneratedSource,
+          fallthrough: continuationBlock.id,
         },
         continuationBlock,
       );
@@ -1163,6 +1172,11 @@ function lowerStatement(
       const left = stmt.get('left');
       const leftLoc = left.node.loc ?? GeneratedSource;
       let test: Place;
+      const nextPropertyTemp = lowerValueToTemporary(builder, {
+        kind: 'NextPropertyOf',
+        loc: leftLoc,
+        value,
+      });
       if (left.isVariableDeclaration()) {
         const declarations = left.get('declarations');
         CompilerError.invariant(declarations.length === 1, {
@@ -1172,11 +1186,6 @@ function lowerStatement(
           suggestions: null,
         });
         const id = declarations[0].get('id');
-        const nextPropertyTemp = lowerValueToTemporary(builder, {
-          kind: 'NextPropertyOf',
-          loc: leftLoc,
-          value,
-        });
         const assign = lowerAssignment(
           builder,
           leftLoc,
@@ -1187,13 +1196,19 @@ function lowerStatement(
         );
         test = lowerValueToTemporary(builder, assign);
       } else {
-        builder.errors.push({
-          reason: `(BuildHIR::lowerStatement) Handle ${left.type} inits in ForInStatement`,
-          severity: ErrorSeverity.Todo,
-          loc: left.node.loc ?? null,
-          suggestions: null,
+        CompilerError.invariant(left.isLVal(), {
+          loc: leftLoc,
+          reason: 'Expected ForIn init to be a variable declaration or lval',
         });
-        return;
+        const assign = lowerAssignment(
+          builder,
+          leftLoc,
+          InstructionKind.Reassign,
+          left,
+          nextPropertyTemp,
+          'Assignment',
+        );
+        test = lowerValueToTemporary(builder, assign);
       }
       builder.terminateWithContinuation(
         {
@@ -1202,6 +1217,7 @@ function lowerStatement(
           test,
           consequent: loopBlock,
           alternate: continuationBlock.id,
+          fallthrough: continuationBlock.id,
           loc: stmt.node.loc ?? GeneratedSource,
         },
         continuationBlock,
@@ -1414,7 +1430,7 @@ function lowerObjectPropertyKey(
       name: key.node.value,
     };
   } else if (property.node.computed && key.isExpression()) {
-    if (!key.isIdentifier()) {
+    if (!key.isIdentifier() && !key.isMemberExpression()) {
       /*
        * NOTE: allowing complex key expressions can trigger a bug where a mutation is made conditional
        * see fixture
@@ -1799,6 +1815,7 @@ function lowerExpression(
           test: {...testPlace},
           consequent: consequentBlock,
           alternate: alternateBlock,
+          fallthrough: continuationBlock.id,
           id: makeInstructionId(0),
           loc: exprLoc,
         },
@@ -1877,6 +1894,7 @@ function lowerExpression(
           test: {...leftPlace},
           consequent,
           alternate,
+          fallthrough: continuationBlock.id,
           id: makeInstructionId(0),
           loc: exprLoc,
         },
@@ -2610,6 +2628,7 @@ function lowerOptionalMemberExpression(
       test: {...object},
       consequent: consequent.id,
       alternate,
+      fallthrough: continuationBlock.id,
       id: makeInstructionId(0),
       loc,
     };
@@ -2749,6 +2768,7 @@ function lowerOptionalCallExpression(
       test: {...testPlace},
       consequent: consequent.id,
       alternate,
+      fallthrough: continuationBlock.id,
       id: makeInstructionId(0),
       loc,
     };
@@ -3178,7 +3198,13 @@ function lowerJsxMemberExpression(
       loc: object.node.loc ?? null,
       suggestions: null,
     });
-    objectPlace = lowerIdentifier(builder, object);
+
+    const kind = getLoadKind(builder, object);
+    objectPlace = lowerValueToTemporary(builder, {
+      kind: kind,
+      place: lowerIdentifier(builder, object),
+      loc: exprPath.node.loc ?? GeneratedSource,
+    });
   }
   const property = exprPath.get('property').node.name;
   return lowerValueToTemporary(builder, {
@@ -4024,6 +4050,7 @@ function lowerAssignment(
           test: {...test},
           consequent,
           alternate,
+          fallthrough: continuationBlock.id,
           id: makeInstructionId(0),
           loc,
         },
